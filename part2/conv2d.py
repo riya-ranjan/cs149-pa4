@@ -88,8 +88,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                                 buffer=nl.sbuf,
                             )
                             nisa.dma_copy(dst=input_mul, src=X[b, c_in_ind * c_in_par_dim:(c_in_ind+1) * c_in_par_dim, out_row+i, j:j+out_width])
-                            # we get 1 row, so reshape to be just 1 row of data
-                            # input_mul = input_mul.reshape((in_channels, 1 * out_width))
 
                             ##grab filter weight
                             filter_mul = nl.ndarray(
