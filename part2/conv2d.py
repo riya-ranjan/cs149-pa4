@@ -51,6 +51,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
     
+    print("Dimensions are: \n " + str(out_channels) + " C_out, " + str(out_width) + " out_width\n")
     # Can assume multiple of 128 to avoid using mask
     assert in_channels % 128 == out_channels % 128 == 0
 
@@ -64,61 +65,49 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         buffer=nl.hbm,
     )
 
-    X_out_re = nl.ndarray(
-        shape=(batch_size, out_channels, out_height * out_width),
-        dtype=X.dtype,
-        buffer=nl.hbm,
-    )
+    # initialize tiling dimensions
+    c_out_par_dim = nl.tile_size.gemm_stationary_fmax       #128
+    num_c_out_tiles = out_channels // c_out_par_dim
 
-    # tiles for matmul
-    TILE_M = nl.tile_size.gemm_stationary_fmax #128
-    TILE_N = nl.tile_size.gemm_moving_fmax #512
-    TILE_K = nl.tile_size.pmax #128
-
-    M = out_channels
-    N = out_height * out_width
-    K = in_channels
-
-    for b in nl.affine_range(batch_size):
-        for m in nl.affine_range(M // TILE_M):
-            for n in nl.affine_range(N // TILE_N):
-                nl.store(dst=X_out_re[b, m*TILE_M : (m+1)*TILE_M, n*TILE_N:(n+1)*TILE_N], value=0);
-
-    X_out_interm = nl.ndarray(
-        shape=(TILE_M, TILE_N),
-        dtype=X.dtype,
-        buffer=nl.hbm,
-    )
+    c_in_par_dim = nl.tile_size.pmax        # 128
+    num_c_in_tiles = in_channels // c_in_par_dim
 
     # process the images in batches
     for b in nl.affine_range(batch_size):
-        for i in nl.affine_range(filter_height):
-            for j in nl.affine_range(filter_width):
-                # get the part of the input we care about for the pixel i,j in our filter
-                input_chopped = nl.ndarray(shape=(in_channels, out_height, out_width), dtype=X.dtype, buffer=nl.sbuf)
-                nisa.dma_copy(dst=input_chopped, src=X[b, :, i:i+out_height, j:j+out_width])
-                input_chopped = input_chopped.reshape((in_channels, out_height*out_width))
-                for m in nl.affine_range(M // TILE_M):
-                    for n in nl.affine_range(N // TILE_N):  # if our last tile is slightly empty, we'll do some extra math
-                        res_psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                        for k in nl.affine_range(K // TILE_K):
-                            # declare tiles in the SBUF
-                            filter_tile = nl.ndarray((TILE_M, TILE_K), dtype=W.dtype, buffer=nl.sbuf)
-                            filter_tile_T = nl.ndarray((TILE_K, TILE_M), dtype=W.dtype, buffer=nl.sbuf)
-                            input_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
+        for out_row in nl.affine_range(out_height):
+            for c_out_ind in nl.affine_range(num_c_out_tiles):
+                res_psum = nl.zeros((c_out_par_dim, out_width * 1), nl.float32, buffer=nl.psum)
+                for c_in_ind in nl.affine_range(num_c_in_tiles):
+                    for i in nl.affine_range(filter_height):
+                        for j in nl.affine_range(filter_width):
 
-                            # load data into our tiles
-                            nisa.dma_copy(dst=filter_tile, src=W[m*TILE_M : (m+1)*TILE_M, k*TILE_K : (k+1)*TILE_K, i, j])
-                            fl_tile_interm = nisa.nc_transpose(filter_tile)
-                            filter_tile_T = nisa.tensor_copy(fl_tile_interm, engine=nisa.vector_engine)
-                            nisa.dma_copy(dst=input_tile, src=input_chopped[k*TILE_K : (k+1)*TILE_K, n*TILE_N : (n+1)*TILE_N])
+                            ## grab input
+                            input_mul = nl.ndarray(
+                                shape=(c_in_par_dim, out_width),
+                                dtype=X.dtype,
+                                buffer=nl.sbuf,
+                            )
+                            nisa.dma_copy(dst=input_mul, src=X[b, c_in_ind * c_in_par_dim:(c_in_ind+1) * c_in_par_dim, out_row+i, j:j+out_width])
+                            # we get 1 row, so reshape to be just 1 row of data
+                            # input_mul = input_mul.reshape((in_channels, 1 * out_width))
 
-                            #accumulate partial sums into PSUM
-                            res_psum += nisa.nc_matmul(filter_tile_T[...], input_tile[...])
+                            ##grab filter weight
+                            filter_mul = nl.ndarray(
+                                shape=(c_out_par_dim, c_in_par_dim),
+                                dtype=W.dtype,
+                                buffer=nl.sbuf,
+                            )
+                            filter_mul_T = nl.ndarray(
+                                shape=(c_in_par_dim, c_out_par_dim),
+                                dtype=W.dtype,
+                                buffer=nl.sbuf,
+                            )
 
-                        res_sb = nl.copy(res_psum, dtype=X_out.dtype)
-                        nisa.dma_copy(dst=X_out_interm, src=res_sb)
-                        X_out_re[b, m*TILE_M : (m+1)*TILE_M, n*TILE_N : (n+1)*tile_N] += res_sb 
-    X_out_re = X_out_re.reshape((batch_size, out_channels, out_pool_height, out_pool_width))
-    nki.tensor.store(X_out_re, X_out)
+                            nisa.dma_copy(dst=filter_mul, src=W[c_out_ind * c_out_par_dim : (c_out_ind + 1) * c_out_par_dim, c_in_ind * c_in_par_dim : (c_in_ind + 1) * c_in_par_dim, i, j])
+                            filter_psum = nisa.nc_transpose(filter_mul)
+                            filter_mul_T = nisa.tensor_copy(filter_psum, engine=nisa.vector_engine)
+
+                            res_psum += nisa.nc_matmul(filter_mul_T, input_mul)
+                res_sbuf = nl.copy(res_psum, dtype=X_out.dtype)
+                nisa.dma_copy(dst=X_out[b, c_out_ind * c_out_par_dim : (c_out_ind + 1) * c_out_par_dim, out_row, :], src=res_sbuf)
     return X_out
