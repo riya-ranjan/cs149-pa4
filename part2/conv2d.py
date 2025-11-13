@@ -36,9 +36,6 @@ The shape of the output should be [batch_size, out_channels, out_pool_height, ou
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def fused_conv2d_maxpool(X, W, bias, pool_size=1):
-
-    # print(f"bias shape : {bias.shape}")
-
     batch_size, in_channels, input_height, input_width = X.shape
     out_channels, in_channels_, filter_height, filter_width = W.shape
     out_channels_ = bias.shape[0]
@@ -53,7 +50,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
     
-    print("Dimensions are: \n " + str(out_channels) + " C_out, " + str(out_width) + " out_width\n")
     # Can assume multiple of 128 to avoid using mask
     assert in_channels % 128 == out_channels % 128 == 0
 
@@ -84,19 +80,19 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         dtype=X.dtype,
         buffer=nl.sbuf,
     )
+    w_sbuf = nl.ndarray(
+        shape=((c_out_par_dim, num_c_out_tiles, c_in_par_dim, num_c_in_tiles, filter_height, filter_width)),
+        dtype=X.dtype,
+        buffer=nl.sbuf,
+    )
 
     # pretranspose all the weights in our weight matrix
     for out_tile in nl.affine_range(num_c_out_tiles):
         for in_tile in nl.affine_range(num_c_in_tiles):
+            nisa.dma_copy(src=W[out_tile, :, in_tile, :, :], dst=w_sbuf[:, out_tile, :, in_tile, : ,:])
             for i in nl.affine_range(filter_height):
                 for j in nl.affine_range(filter_width):
-                    temp_weight = nl.ndarray(
-                        shape=(c_out_par_dim, c_in_par_dim),
-                        dtype=W.dtype,
-                        buffer=nl.sbuf,
-                    )
-                    nisa.dma_copy(dst=temp_weight, src=W[out_tile, :, in_tile, :, i, j])
-                    w_psum = nisa.nc_transpose(temp_weight)
+                    w_psum = nisa.nc_transpose(w_sbuf[:, out_tile, :, in_tile, i, j])
                     w_transpose[:, in_tile, :, out_tile, i, j] = nisa.tensor_copy(w_psum, engine=nisa.vector_engine)
 
     # process the images in batches
