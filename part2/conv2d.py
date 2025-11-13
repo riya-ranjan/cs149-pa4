@@ -120,6 +120,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         for i in nl.affine_range(filter_height):
                             for j in nl.affine_range(filter_width):
                                 res_psum += nisa.nc_matmul(w_transpose[:, c_in_ind, :, c_out_ind, i, j], temp_X[:, i, j:j+out_width])
+    
                     pool_sbuf[:, :, out_row] = nisa.tensor_copy(res_psum, engine=nisa.vector_engine)
                     pool_sbuf[:, :, out_row] = nisa.tensor_tensor(pool_sbuf[:, :, out_row], bias_temp, op=nl.add)
 
