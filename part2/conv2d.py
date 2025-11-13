@@ -77,6 +77,28 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     rows_per_chunk = pool_size
     chunks_in_image = out_pool_height
 
+    # preprocess all the weights
+    W = W.reshape((num_c_out_tiles, c_out_par_dim, num_c_in_tiles, c_in_par_dim, filter_height, filter_width))
+    w_transpose = nl.ndarray(
+        shape=((c_in_par_dim, num_c_in_tiles, c_out_par_dim, num_c_out_tiles, filter_height, filter_width)),
+        dtype=X.dtype,
+        buffer=nl.sbuf,
+    )
+
+    # pretranspose all the weights in our weight matrix
+    for out_tile in nl.affine_range(num_c_out_tiles):
+        for in_tile in nl.affine_range(num_c_in_tiles):
+            for i in nl.affine_range(filter_height):
+                for j in nl.affine_range(filter_width):
+                    temp_weight = nl.ndarray(
+                        shape=(c_out_par_dim, c_in_par_dim),
+                        dtype=W.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.dma_copy(dst=temp_weight, src=W[out_tile, :, in_tile, :, i, j])
+                    w_psum = nisa.nc_transpose(temp_weight)
+                    w_transpose[:, in_tile, :, out_tile, i, j] = nisa.tensor_copy(w_psum, engine=nisa.vector_engine)
+
     # process the images in batches
     for b in nl.affine_range(batch_size):
         for c_out_ind in nl.affine_range(num_c_out_tiles):
@@ -93,34 +115,16 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 for out_row in nl.affine_range(rows_per_chunk):
                     res_psum = nl.zeros((c_out_par_dim, out_width * 1), nl.float32, buffer=nl.psum)
                     for c_in_ind in nl.affine_range(num_c_in_tiles):
+                        temp_X = nl.ndarray(
+                            shape=(c_in_par_dim, filter_height, input_width),
+                            dtype=X.dtype,
+                            buffer=nl.sbuf,
+                        )
+                        nisa.dma_copy(dst=temp_X, src=X[b, c_in_ind * c_in_par_dim:(c_in_ind+1) * c_in_par_dim, row_chunk*rows_per_chunk+out_row : row_chunk*rows_per_chunk+out_row+filter_height, :])
                         for i in nl.affine_range(filter_height):
                             for j in nl.affine_range(filter_width):
-
-                                ## grab input
-                                input_mul = nl.ndarray(
-                                    shape=(c_in_par_dim, out_width),
-                                    dtype=X.dtype,
-                                    buffer=nl.sbuf,
-                                )
-                                nisa.dma_copy(dst=input_mul, src=X[b, c_in_ind * c_in_par_dim:(c_in_ind+1) * c_in_par_dim, row_chunk*rows_per_chunk + out_row+i, j:j+out_width])
-
-                                ## grab filter weight
-                                filter_mul = nl.ndarray(
-                                    shape=(c_out_par_dim, c_in_par_dim),
-                                    dtype=W.dtype,
-                                    buffer=nl.sbuf,
-                                )
-                                filter_mul_T = nl.ndarray(
-                                    shape=(c_in_par_dim, c_out_par_dim),
-                                    dtype=W.dtype,
-                                    buffer=nl.sbuf,
-                                )
-
-                                nisa.dma_copy(dst=filter_mul, src=W[c_out_ind * c_out_par_dim : (c_out_ind + 1) * c_out_par_dim, c_in_ind * c_in_par_dim : (c_in_ind + 1) * c_in_par_dim, i, j])
-                                filter_psum = nisa.nc_transpose(filter_mul)
-                                filter_mul_T = nisa.tensor_copy(filter_psum, engine=nisa.vector_engine)
-
-                                res_psum += nisa.nc_matmul(filter_mul_T, input_mul)
+                                input_mul = nisa.tensor_copy(temp_X[:, i, j:j+out_width])
+                                res_psum += nisa.nc_matmul(w_transpose[:, c_in_ind, :, c_out_ind, i, j], input_mul)
                     
                     res_sbuf = nl.copy(res_psum, dtype=X_out.dtype)
                     res_sbuf[...] = nisa.tensor_tensor(res_sbuf, bias_temp, op=nl.add)
@@ -129,7 +133,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 # perform pooling if necessary:
                 
                 # reshape our pool_sbuf so that we can compute the max along the correct dimensions
-                
                 pool_sbuf = pool_sbuf.reshape((c_out_par_dim, out_pool_width, pool_size, rows_per_chunk))
                 pool_sbuf = pool_sbuf.reshape((c_out_par_dim, out_pool_width, rows_per_chunk * pool_size))
                 pool_sbuf_copy = nisa.tensor_reduce(nl.max, pool_sbuf, axis=[2])
