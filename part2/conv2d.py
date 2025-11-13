@@ -123,12 +123,9 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         nisa.dma_copy(dst=temp_X, src=X[b, c_in_ind * c_in_par_dim:(c_in_ind+1) * c_in_par_dim, row_chunk*rows_per_chunk+out_row : row_chunk*rows_per_chunk+out_row+filter_height, :])
                         for i in nl.affine_range(filter_height):
                             for j in nl.affine_range(filter_width):
-                                input_mul = nisa.tensor_copy(temp_X[:, i, j:j+out_width])
-                                res_psum += nisa.nc_matmul(w_transpose[:, c_in_ind, :, c_out_ind, i, j], input_mul)
-                    
-                    res_sbuf = nl.copy(res_psum, dtype=X_out.dtype)
-                    res_sbuf[...] = nisa.tensor_tensor(res_sbuf, bias_temp, op=nl.add)
-                    pool_sbuf[:, :, out_row] = nisa.tensor_copy(res_sbuf, engine=nisa.vector_engine)
+                                res_psum += nisa.nc_matmul(w_transpose[:, c_in_ind, :, c_out_ind, i, j], temp_X[:, i, j:j+out_width])
+                    pool_sbuf[:, :, out_row] = nisa.tensor_copy(res_psum, engine=nisa.vector_engine)
+                    pool_sbuf[:, :, out_row] = nisa.tensor_tensor(pool_sbuf[:, :, out_row], bias_temp, op=nl.add)
 
                 # perform pooling if necessary:
                 
