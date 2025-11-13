@@ -37,6 +37,8 @@ The shape of the output should be [batch_size, out_channels, out_pool_height, ou
 @nki.jit
 def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
+    # print(f"bias shape : {bias.shape}")
+
     batch_size, in_channels, input_height, input_width = X.shape
     out_channels, in_channels_, filter_height, filter_width = W.shape
     out_channels_ = bias.shape[0]
@@ -77,6 +79,13 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         for out_row in nl.affine_range(out_height):
             for c_out_ind in nl.affine_range(num_c_out_tiles):
                 res_psum = nl.zeros((c_out_par_dim, out_width * 1), nl.float32, buffer=nl.psum)
+
+                bias_temp = nl.load(
+                    bias[c_out_ind * c_out_par_dim : (c_out_ind + 1) * c_out_par_dim], 
+                    dtype=bias.dtype,
+                )
+                bias_tile = nl.broadcast_to(bias_temp, shape=(bias_temp.shape[0], out_width*1))
+
                 for c_in_ind in nl.affine_range(num_c_in_tiles):
                     for i in nl.affine_range(filter_height):
                         for j in nl.affine_range(filter_width):
@@ -106,6 +115,8 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             filter_mul_T = nisa.tensor_copy(filter_psum, engine=nisa.vector_engine)
 
                             res_psum += nisa.nc_matmul(filter_mul_T, input_mul)
+                
                 res_sbuf = nl.copy(res_psum, dtype=X_out.dtype)
+                res_sbuf = nisa.tensor_tensor(res_sbuf, bias_tile, op=nl.add)
                 nisa.dma_copy(dst=X_out[b, c_out_ind * c_out_par_dim : (c_out_ind + 1) * c_out_par_dim, out_row, :], src=res_sbuf)
     return X_out
